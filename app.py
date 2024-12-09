@@ -1,112 +1,122 @@
-import base64
 from flask import Flask, request, jsonify
-import jwt
-from datetime import datetime, timedelta, timezone
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
+from argon2 import PasswordHasher
 import sqlite3
+import os
+import uuid
 
-db_file = 'totally_not_my_privateKeys.db'
-
-# Initialize the database and insert keys
-def init_db():
-    conn = sqlite3.connect(db_file)
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS keys(
-        kid INTEGER PRIMARY KEY AUTOINCREMENT,
-        key BLOB NOT NULL,
-        exp INTEGER NOT NULL
-    )''')
-    
-    # Inserting two keys: one valid, one expired
-    valid_key = '3ba010226cd84939b9eed91aa6bd9519'
-    expired_key = '3ba010226cd84939b9eed91aa6bd9519'  # Same key for demonstration
-    
-    # Convert keys to base64 for JWKS
-    valid_key_encoded = base64.urlsafe_b64encode(valid_key.encode('utf-8')).decode('utf-8')
-    expired_key_encoded = base64.urlsafe_b64encode(expired_key.encode('utf-8')).decode('utf-8')
-    
-    # Expiration times
-    time_valid = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())  # valid for 1 hour
-    time_expired = int((datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp())  # expired 10 seconds ago
-    
-    # Insert into database
-    cursor.execute('INSERT INTO keys (key, exp) VALUES (?, ?)', (valid_key_encoded, time_valid))
-    cursor.execute('INSERT INTO keys (key, exp) VALUES (?, ?)', (expired_key_encoded, time_expired))
-    conn.commit()
-    conn.close()
-
-# Retrieve key from DB based on expiration status
-def get_key_from_db(expired=False):
-    conn = sqlite3.connect(db_file)
-    cursor = conn.cursor()
-    current_time = int(datetime.now(timezone.utc).timestamp())
-    
-    if expired:
-        cursor.execute('SELECT kid, key FROM keys WHERE exp <= ? LIMIT 1', (current_time,))
-    else:
-        cursor.execute('SELECT kid, key FROM keys WHERE exp > ? LIMIT 1', (current_time,))
-    
-    row = cursor.fetchone()
-    conn.close()
-    return row
-
-# Initialize Flask app
 app = Flask(__name__)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["10 per second"]  # 10 requests per second
+)
+
+# Database setup
+DATABASE = "totally_not_my_privateKeys.db"
+NOT_MY_KEY = os.environ.get("NOT_MY_KEY", b"16BYTEKEY_123456")  # AES key (must be 16 bytes)
+ph = PasswordHasher()
+
+def init_db():
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            email TEXT UNIQUE,
+            date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS auth_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_ip TEXT NOT NULL,
+            request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            user_id INTEGER,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """)
+        conn.commit()
+
 init_db()
 
-@app.route('/auth', methods=['POST'])
+# AES Encryption functions
+def encrypt(data):
+    padder = padding.PKCS7(algorithms.AES.block_size).padder()
+    padded_data = padder.update(data) + padder.finalize()
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(NOT_MY_KEY), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+    return iv + encrypted_data
+
+def decrypt(encrypted_data):
+    iv = encrypted_data[:16]
+    encrypted_content = encrypted_data[16:]
+    cipher = Cipher(algorithms.AES(NOT_MY_KEY), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded_data = decryptor.update(encrypted_content) + decryptor.finalize()
+    unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+    return unpadder.update(padded_data) + unpadder.finalize()
+
+# Register endpoint
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.json
+    username = data.get("username")
+    email = data.get("email")
+    password = str(uuid.uuid4())  # Generate UUID password
+    password_hash = ph.hash(password)
+
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)",
+                           (username, password_hash, email))
+            conn.commit()
+            return jsonify({"password": password}), 201
+        except sqlite3.IntegrityError:
+            return jsonify({"error": "User already exists"}), 400
+
+# Authentication logging
+@app.route("/auth", methods=["POST"])
+@limiter.limit("10 per second")  # Apply rate limiting here
 def auth():
-    expired = request.args.get('expired') is not None
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
 
-    # Fetch key from DB
-    key_data = get_key_from_db(expired=expired)
-    if not key_data:
-        return jsonify({"error": "No key found"}), 404
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+        if user:
+            user_id, password_hash = user
+            try:
+                if ph.verify(password_hash, password):
+                    cursor.execute("INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)",
+                                   (request.remote_addr, user_id))
+                    conn.commit()
+                    return jsonify({"status": "authenticated"}), 200
+            except Exception:
+                pass
+    return jsonify({"status": "unauthorized"}), 401
 
-    kid, key = key_data
-    key = base64.urlsafe_b64decode(key).decode('utf-8')  # Decode from base64
-
-    # Create JWT payload
-    body = {
-        'Fullname': "username",
-        'Password': "password",
-        'iat': datetime.now(timezone.utc),
-    }
-
-    if expired:
-        # Set token to be expired
-        body['exp'] = datetime.now(timezone.utc) - timedelta(seconds=10)
-    else:
-        # Set token to expire in 1 hour
-        body['exp'] = datetime.now(timezone.utc) + timedelta(hours=1)
-
-    # Encode JWT
-    token = jwt.encode(body, key, algorithm='HS256', headers={'kid': str(kid)})
-
-    return jsonify({"token": token})
-
-@app.route('/.well-known/jwks.json', methods=['GET'])
-def get_jwks():
-    conn = sqlite3.connect(db_file)
-    cursor = conn.cursor()
-    current_time = int(datetime.now(timezone.utc).timestamp())
-    
-    cursor.execute('SELECT kid, key FROM keys WHERE exp > ?', (current_time,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    # Create JWKS response
-    jwks_data = {"keys": []}
-    for row in rows:
-        kid, key = row
-        jwks_data["keys"].append({
-            "kty": "oct",
-            "k": key,
-            "alg": "HS256",
-            "use": "sig",
-            "kid": str(kid)
-        })
-
-    return jsonify(jwks_data)
+# Show all logs
+@app.route("/logs", methods=["GET"])
+def logs():
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM auth_logs")
+        logs = cursor.fetchall()
+        return jsonify(logs)
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=8080)
+    app.run(debug=True, port=8080)  # Updated port to 8080
